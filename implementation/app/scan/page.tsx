@@ -274,15 +274,83 @@ export default function ScanPage() {
     return { raw, parsedId: id, isCumulocity: isC8y, payload };
   };
 
-  const registerDevice = async (id: string) => {
-    setSuccess(null);
-    try {
-      const res = await fetch("/api/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
-      if (!res.ok) { const data = await res.json().catch(() => ({})); throw new Error(data?.error || `Registrierung fehlgeschlagen (${res.status}).`); }
-      setSuccess(`Gerät ${id} erfolgreich registriert.`);
-      setScanning(false);
-    } catch (e: any) { setError(e?.message || "Registrierung fehlgeschlagen."); }
-  };
+// ——— Add these new states at the top of your component ———
+const [credsStatus, setCredsStatus] = useState<"idle" | "waiting" | "ready" | "error">("idle");
+const [creds, setCreds] = useState<{ tenantId: string; username: string; password: string } | null>(null);
+
+// ——— Helper function: request device credentials after registration ———
+const requestDeviceCredentials = async (id: string) => {
+  setCredsStatus("waiting");
+  setCreds(null);
+  setError(null);
+  setDeviceId(id); // <-- store it globally for later use
+
+  try {
+    const res = await fetch("/api/device-credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, pollMs: 2000, timeoutMs: 60000 }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      const details = data?.raw ? ` Details: ${JSON.stringify(data.raw)}` : "";
+      throw new Error((data?.error || `Credential request failed (${res.status}).`) + details);
+    }
+
+    const c = data?.credentials;
+    if (!c?.tenantId || !c?.username || !c?.password) {
+      const details = data?.raw ? ` Details: ${JSON.stringify(data.raw)}` : "";
+      throw new Error("Malformed credentials from server." + details);
+    }
+
+    // ✅ Success — save credentials and mark ready
+    setCreds({
+      tenantId: c.tenantId,
+      username: c.username,
+      password: c.password,
+    });
+    setCredsStatus("ready");
+  } catch (e: any) {
+    setCredsStatus("error");
+    setError(e?.message || "Credential polling failed.");
+  }
+};
+
+// ——— Modified registerDevice() to call credential polling after success ———
+const registerDevice = async (id: string) => {
+  setSuccess(null);
+  setError(null);
+  setCredsStatus("idle");
+  setCreds(null);
+  setDeviceId(id); // <-- store here too
+
+  try {
+    const res = await fetch("/api/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      throw new Error(data?.error || `Registrierung fehlgeschlagen (${res.status}).`);
+    }
+
+    // ✅ First step succeeded
+    setSuccess(`Gerät ${id} erfolgreich registriert.`);
+    setScanning(false);
+
+    // 👉 Automatically trigger credentials polling
+    requestDeviceCredentials(id);
+
+  } catch (e: any) {
+    setError(e?.message || "Registrierung fehlgeschlagen.");
+  }
+};
+
 
   const handleRaw = async (raw: string) => {
     if (busy) return; setBusy(true); setError(null);
@@ -322,6 +390,8 @@ export default function ScanPage() {
     } catch { setError("Bild konnte nicht verarbeitet werden."); }
   };
 
+
+  
   const onManual = async (e: React.FormEvent) => { e.preventDefault(); if (!manualId.trim()) return setError("Bitte eine ID eingeben."); await registerDevice(manualId.trim()); };
   const onPayload = async () => { if (!payloadText.trim()) return; await handleRaw(payloadText.trim()); };
   const reset = () => { setScanning(true); setSuccess(null); setError(null); setResult(null); };
@@ -419,6 +489,55 @@ export default function ScanPage() {
                   </motion.div>
                 )}
               </AnimatePresence>
+              {/* Credential status line (compact; place below the error/tip row) */}
+<div className="mt-3 text-sm">
+  {credsStatus === "waiting" && (
+    <div className="flex items-center gap-2 text-slate-600">
+      <Loader2 className="h-4 w-4 animate-spin" />
+      <span>
+        Warte auf Freigabe in Cumulocity …
+        <br />
+        (Sobald akzeptiert, werden Credentials automatisch abgerufen)
+      </span>
+    </div>
+  )}
+
+  {credsStatus === "ready" && creds && (
+    <div className="rounded-lg border border-emerald-300/50 bg-emerald-50 px-3 py-2 text-emerald-900">
+      <div className="font-medium mb-1">Geräte-Credentials erhalten 🎉</div>
+      <div className="text-xs">
+        <div><span className="font-mono">tenantId</span>: {creds.tenantId}</div>
+        <div><span className="font-mono">username</span>: {creds.username}</div>
+        <div><span className="font-mono">password</span>: {creds.password}</div>
+      </div>
+
+      <Button
+        size="sm"
+        variant="outline"
+        className="mt-2"
+        onClick={() => {
+          const blob = new Blob([JSON.stringify(creds, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${deviceId || "device"}_credentials.json`; // ✅ fixed variable
+          a.click();
+          URL.revokeObjectURL(url);
+        }}
+      >
+        Download credentials.json
+      </Button>
+    </div>
+  )}
+
+  {credsStatus === "error" && (
+    <div className="flex items-center gap-2 text-red-600">
+      <XCircle className="h-4 w-4" />
+      <span>{error || "Credentials konnten nicht abgerufen werden."}</span>
+    </div>
+  )}
+</div>
+
               <div className="text-xs text-slate-500 mt-5">Tipp: <kbd className="rounded border bg-white px-1">U</kbd> lädt ein Bild hoch</div>
             </div>
 
