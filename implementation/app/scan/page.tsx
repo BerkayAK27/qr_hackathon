@@ -27,6 +27,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import jsQR from "jsqr"; // <-- NEU: Fallback-Decoder, UI bleibt unverändert
 
 // ——— Types ———
 interface ScanResult { raw: string; parsedId?: string; isCumulocity: boolean; payload?: any }
@@ -158,7 +159,18 @@ export default function ScanPage() {
   const [manualId, setManualId] = useState("");
   const [payloadText, setPayloadText] = useState("");
 
-  useEffect(() => { setBarcodeSupported(typeof (window as any).BarcodeDetector !== "undefined"); }, []);
+  // Robuster Feature-Check: existiert BD und unterstützt er "qr_code"?
+  useEffect(() => {
+    const BD = (window as any).BarcodeDetector;
+    if (!BD) { setBarcodeSupported(false); return; }
+    if (BD.getSupportedFormats) {
+      BD.getSupportedFormats()
+        .then((formats: string[]) => setBarcodeSupported(formats?.includes("qr_code")))
+        .catch(() => setBarcodeSupported(false));
+    } else {
+      setBarcodeSupported(true);
+    }
+  }, []);
 
   // Auto-dismiss success toast after a short delay
   useEffect(() => {
@@ -228,13 +240,28 @@ export default function ScanPage() {
     }
   };
 
-  // Decode loop
+  // Decode loop: nutzt BarcodeDetector ODER jsQR-Fallback, UI unverändert
   useInterval(async () => {
-    if (!scanning || !videoRef.current || !frameReady || !barcodeSupported) return;
+    if (!scanning || !videoRef.current || !frameReady) return;
     try {
-      const detector = new (window as any).BarcodeDetector({ formats: ["qr_code"] });
-      const codes = await detector.detect(videoRef.current);
-      if (codes?.length) handleRaw(codes[0].rawValue || "");
+      if (barcodeSupported) {
+        const detector = new (window as any).BarcodeDetector({ formats: ["qr_code"] });
+        const codes = await detector.detect(videoRef.current);
+        if (codes?.length) handleRaw(codes[0].rawValue || "");
+      } else {
+        // Fallback mit jsQR (Canvas)
+        const v = videoRef.current;
+        if (!v.videoWidth || !v.videoHeight) return;
+        const canvas = document.createElement("canvas");
+        const w = (canvas.width = v.videoWidth);
+        const h = (canvas.height = v.videoHeight);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(v, 0, 0, w, h);
+        const img = ctx.getImageData(0, 0, w, h);
+        const code = jsQR(img.data, w, h);
+        if (code?.data) handleRaw(code.data);
+      }
     } catch {}
   }, 170);
 
@@ -266,17 +293,31 @@ export default function ScanPage() {
     } finally { setBusy(false); }
   };
 
-  // Image upload
+  // Image upload (nutzt BD wenn möglich, sonst jsQR)
   const hiddenFile = useRef<HTMLInputElement | null>(null);
   const onImageSelected = async (file?: File) => {
     if (!file) return; setError(null);
     try {
       const bitmap = await createImageBitmap(file);
+
       if (barcodeSupported) {
-        const detector = new (window as any).BarcodeDetector({ formats: ["qr_code"] });
-        const codes = await detector.detect(bitmap as any);
-        if (codes?.length) { await handleRaw(codes[0].rawValue || ""); return; }
+        try {
+          const detector = new (window as any).BarcodeDetector({ formats: ["qr_code"] });
+          const codes = await detector.detect(bitmap as any);
+          if (codes?.length) { await handleRaw(codes[0].rawValue || ""); return; }
+        } catch {}
       }
+
+      // Fallback: jsQR
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width; canvas.height = bitmap.height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas nicht verfügbar");
+      ctx.drawImage(bitmap, 0, 0);
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(img.data, canvas.width, canvas.height);
+      if (code?.data) { await handleRaw(code.data); return; }
+
       setError("QR konnte nicht erkannt werden. Bitte erneut versuchen oder manuell eingeben.");
     } catch { setError("Bild konnte nicht verarbeitet werden."); }
   };
